@@ -1,0 +1,6 @@
+# requirements.txt
+pandas>=1.5
+numpy>=1.20
+yfinance>=0.2.30
+# Add peewee if you used it in data.py (remove if not)
+# peewee>=3.0
