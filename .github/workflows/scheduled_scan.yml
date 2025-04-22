@@ -1,0 +1,37 @@
+name: Scheduled Stock Scan
+
+on:
+  schedule:
+    # Runs Wednesdays and Fridays at approx 07:00 UTC
+    - cron: '0 7 * * 3,5'
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  run-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Match your env
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else echo "requirements.txt not found"; exit 1; fi
+
+      - name: Run Scheduled Scan Script
+        env: # Pass secrets as environment variables using LS_ prefix
+          LS_SMTP_HOST: ${{ secrets.LS_SMTP_HOST }}
+          LS_SMTP_PORT: ${{ secrets.LS_SMTP_PORT }}
+          LS_SMTP_USER: ${{ secrets.LS_SMTP_USER }}
+          LS_SMTP_PASSWORD: ${{ secrets.LS_SMTP_PASSWORD }}
+          LS_FROM_EMAIL: ${{ secrets.LS_FROM_EMAIL }}
+          LS_TO_EMAILS: ${{ secrets.LS_TO_EMAILS }}
+        run: |
+          # Run the wrapper script from the root of the checkout
+          python run_scheduled_scan.py
+
