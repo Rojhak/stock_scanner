@@ -109,8 +109,23 @@ def _fetch_and_prepare_data(symbols: List[str], benchmark: str = "SPY", period: 
     """Fetches price data, prepares benchmark close. Handles MultiIndex benchmark."""
     log.info(f"Fetching data: {len(symbols)} symbols (Universe: {universe_name or 'N/A'}), Benchmark: {benchmark}...")
     today = dt.date.today(); start_date = today - dt.timedelta(days=CONFIG.get("cache_days", 730))
-    if 'y' in period: try: years = int(period.replace('y','')); start_date = today - dt.timedelta(days=years*365); except ValueError: pass
-    elif 'm' in period: try: months = int(period.replace('m','')); start_date = today - dt.timedelta(days=months*30); except ValueError: pass
+    # --- This is the CORRECTED code block ---
+    if 'y' in period:
+        try:
+            years = int(period.replace('y', ''))
+            start_date = today - dt.timedelta(days=years*365)
+        except ValueError:
+            # Handle error or do nothing
+            pass
+    elif 'm' in period:
+        try:
+            months = int(period.replace('m', ''))
+            # Using 30 days per month is an approximation, consider if more precision is needed
+            start_date = today - dt.timedelta(days=months*30)
+        except ValueError:
+            # Handle error or do nothing
+            pass
+    # --- End of CORRECTED code block ---
 
     # Fetch Benchmark Data
     bench_df = get_price_data(benchmark, start_date=start_date, end_date=today, interval=interval, universe_name_for_cache=benchmark)
