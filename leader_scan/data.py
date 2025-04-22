@@ -132,7 +132,12 @@ def get_price_data(
 
         if df_downloaded is None or df_downloaded.empty:
             log.warning(f"No data downloaded (result is None or empty) for tickers: {', '.join(tickers_list)}")
-            if cache_file: try: pd.DataFrame().to_parquet(cache_file, compression="snappy"); except Exception as e: log.error(f"Error saving empty cache {cache_file}: {e}")
+            if cache_file:
+                try:
+                    # Attempt to save an empty DataFrame to initialize cache file if needed
+                    pd.DataFrame().to_parquet(cache_file, compression="snappy")
+                except Exception as e:
+                    log.error(f"Error saving empty cache {cache_file}: {e}")
             return None if yf_exception else pd.DataFrame()
 
         # Post-Download Processing & Validation
