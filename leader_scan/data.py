@@ -158,7 +158,13 @@ def get_price_data(
 
         if df_processed.empty:
             log.error(f"No valid data obtained for requested tickers after processing.")
-            if cache_file: try: pd.DataFrame().to_parquet(cache_file, compression="snappy"); except Exception as e: log.error(f"Error saving empty cache {cache_file}: {e}")
+            # Corrected block to replace line 161 in data.py
+            if cache_file:
+                try:
+                    # Attempt to save an empty DataFrame to initialize cache file if needed
+                    pd.DataFrame().to_parquet(cache_file, compression="snappy")
+                except Exception as e:
+                    log.error(f"Error saving empty cache {cache_file}: {e}")
             return pd.DataFrame()
 
         # Save valid, processed data to cache
