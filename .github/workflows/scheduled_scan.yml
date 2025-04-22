@@ -23,7 +23,31 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else echo "requirements.txt not found"; exit 1; fi
 
-      - name: Run Scheduled Scan Script
+      # --- Debug Step Added Here ---
+      - name: Debug Environment Variables
+        run: |
+          echo "DEBUG: LS_SMTP_HOST = '$LS_SMTP_HOST'"
+          echo "DEBUG: LS_SMTP_PORT = '$LS_SMTP_PORT'"
+          echo "DEBUG: LS_SMTP_USER = '$LS_SMTP_USER'"
+          echo "DEBUG: LS_FROM_EMAIL = '$LS_FROM_EMAIL'"
+          echo "DEBUG: LS_TO_EMAILS = '$LS_TO_EMAILS'"
+          # --- IMPORTANT: Do NOT print the password directly! ---
+          # --- Check if it's set and maybe its length ---
+          if [ -z "$LS_SMTP_PASSWORD" ]; then
+            echo "DEBUG: LS_SMTP_PASSWORD is NOT SET or EMPTY!"
+          else
+            echo "DEBUG: LS_SMTP_PASSWORD is SET (length=${#LS_SMTP_PASSWORD})"
+          fi
+        env: # Need this env block here too so the debug step can access the secrets
+          LS_SMTP_HOST: ${{ secrets.LS_SMTP_HOST }}
+          LS_SMTP_PORT: ${{ secrets.LS_SMTP_PORT }}
+          LS_SMTP_USER: ${{ secrets.LS_SMTP_USER }}
+          LS_SMTP_PASSWORD: ${{ secrets.LS_SMTP_PASSWORD }} # Need to pass it to check if set
+          LS_FROM_EMAIL: ${{ secrets.LS_FROM_EMAIL }}
+          LS_TO_EMAILS: ${{ secrets.LS_TO_EMAILS }}
+      # --- End of Debug Step ---
+
+      - name: Run Scheduled Scan Script # Your original step follows
         env: # Pass secrets as environment variables using LS_ prefix
           LS_SMTP_HOST: ${{ secrets.LS_SMTP_HOST }}
           LS_SMTP_PORT: ${{ secrets.LS_SMTP_PORT }}
@@ -34,4 +58,3 @@ jobs:
         run: |
           # Run the wrapper script from the root of the checkout
           python run_scheduled_scan.py
-
