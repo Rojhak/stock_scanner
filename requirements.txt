@@ -2,5 +2,5 @@
 pandas>=1.5
 numpy>=1.20
 yfinance>=0.2.30
-# Add peewee if you used it in data.py (remove if not)
-# peewee>=3.0
+pyarrow>=10.0 # Or a recent version
+# scipy>=1.8 # Uncomment if needed by screener.py
