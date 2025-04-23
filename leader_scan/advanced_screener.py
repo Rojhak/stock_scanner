@@ -12,6 +12,7 @@ from typing import List, Dict, Optional, Set
 from pathlib import Path # Import pathlib
 import datetime as dt # Import datetime
 import numpy as np # Import numpy
+import time 
 
 # Use absolute imports for clarity within the package
 from .scorer import score_dataframe # Scorer expects Capitalized cols
@@ -174,6 +175,12 @@ def run_advanced_scan_for_all(top_per_universe: int = 5, setup_type_filter: Opti
                 min_r=min_r_filter, top_n=top_per_universe, benchmark=benchmark)
             if leaders_df is not None and not leaders_df.empty: all_results[universe_name] = leaders_df
             else: log.info(f"No results found for universe: {universe_name}")
+             # <<< --- ADD SLEEP HERE (After processing the universe) --- >>>
+            log.info(f"Pausing briefly after processing {universe_name} for advanced scan...")
+            time.sleep(15) # Pause for 15 seconds
+            # <<< ------------------------------------------------------ >>>
+
+
         except ValueError as ve: log.error(f"Skipping '{universe_name}' loading error: {ve}")
         except Exception as e: log.error(f"Failed adv scan '{universe_name}': {type(e).__name__} - {e}", exc_info=False)
 

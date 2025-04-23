@@ -100,6 +100,9 @@ def main():
 
     log.info(f"Running advanced scan (Top {TOP_N}, Type {ADVANCED_SETUP_TYPE_FILTER}, Benchmark {BENCHMARK})...")
     # Call the function from advanced_screener.py with the specific type filter
+        # <<< --- ADD THIS DEBUG LINE --- >>>
+    log.info(f"DEBUG: Value being passed as setup_type_filter is: '{ADVANCED_SETUP_TYPE_FILTER}'")
+        # <<< --- END DEBUG LINE --- >>>
     advanced_results = run_advanced_scan_for_all(top_per_universe=TOP_N, setup_type_filter=ADVANCED_SETUP_TYPE_FILTER, benchmark=BENCHMARK, return_results=True)
 
     log.info("Formatting email body...")

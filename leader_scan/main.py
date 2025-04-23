@@ -16,6 +16,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path # Import needed
 import os
 import numpy as np
+import time
 
 # Setup basic logging
 log_level = logging.INFO
@@ -431,6 +432,12 @@ def run_scan_for_all_universes(top_per_universe: int = 5, alert: bool = False, b
             if leaders_df is not None and not leaders_df.empty:
                  all_results[universe_name] = leaders_df; found_universes.append(universe_name)
             else: log.info(f"No results found for universe: {universe_name}")
+             # <<< --- ADD SLEEP BLOCK HERE --- >>>
+            # This runs AFTER run_daily_scan finishes for the current universe_name
+            # and BEFORE the loop starts the next universe_name.
+            log.info(f"Pausing briefly after processing {universe_name} for leader scan...")
+            time.sleep(15) # Pause for 15 seconds (adjust duration if needed)
+            # <<< --- END OF SLEEP BLOCK --- >>>
         except ValueError as ve: log.error(f"Skipping '{universe_name}' loading error: {ve}")
         except Exception as e: log.error(f"Failed scan '{universe_name}': {type(e).__name__} - {e}", exc_info=False) # Log concisely
 
