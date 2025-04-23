@@ -59,6 +59,7 @@ def safe_scalar(value: Union[pd.Series, np.number, float, int, None]) -> Optiona
 
 def compute_sma_slope(df: pd.DataFrame, window: int = 200) -> pd.DataFrame:
     """Compute the SMA and its slope for the given window. Handles NaNs."""
+    # Assumes df has Capitalized 'Close' column from data loader
     df_out = df.copy()
     sma_col = f"SMA_{window}"
     slope_col = f"SMA_slope_{window}"
@@ -72,8 +73,7 @@ def compute_sma_slope(df: pd.DataFrame, window: int = 200) -> pd.DataFrame:
         # Calculate SMA, handling potential NaNs introduced by rolling window
         df_out[sma_col] = df_out["Close"].rolling(window, min_periods=window // 2).mean()
 
-        # Calculate slope: difference between current SMA and SMA 'window-1' periods ago
-        # More robust slope calculation: change over the last N periods (e.g., 10)
+        # Calculate slope: difference between current SMA and SMA 'n_slope' periods ago
         n_slope = 10 # Lookback for slope calculation
         df_out[slope_col] = df_out[sma_col].diff(n_slope)
 
@@ -85,6 +85,7 @@ def compute_sma_slope(df: pd.DataFrame, window: int = 200) -> pd.DataFrame:
 
 def filter_downtrend(df: pd.DataFrame, window: int = 200, min_days: int = 100) -> bool:
     """Check if the stock is in a confirmed downtrend."""
+    # Assumes df has Capitalized 'Close' and calculated SMA/Slope columns
     sma_col = f"SMA_{window}"
     slope_col = f"SMA_slope_{window}" # Using the N-period slope
 
@@ -121,6 +122,7 @@ def find_swings(df: pd.DataFrame, lookback: int = 20) -> Tuple[Optional[pd.Times
     if argrelextrema is None:
         print("Error: scipy.signal.argrelextrema not available.", file=sys.stderr)
         return None, None
+    # Assumes df has Capitalized 'Close' column
     if 'Close' not in df.columns or len(df) < lookback * 2: # Need enough data
         return None, None
 
@@ -148,6 +150,7 @@ def find_swings(df: pd.DataFrame, lookback: int = 20) -> Tuple[Optional[pd.Times
 
 def compute_fib_levels(df: pd.DataFrame, high_idx: pd.Timestamp, low_idx: pd.Timestamp) -> Optional[Dict[str, float]]:
     """Compute Fibonacci retracement levels based on swing high/low dates."""
+    # Assumes df has Capitalized 'Close' column
     try:
         # Get Close prices at the specific dates (indices)
         high_price = safe_scalar(df.loc[high_idx, "Close"])
@@ -174,6 +177,7 @@ def compute_fib_levels(df: pd.DataFrame, high_idx: pd.Timestamp, low_idx: pd.Tim
 
 def check_stage2_entry(df: pd.DataFrame, fib_levels: Dict[str, float]) -> bool:
     """Check if the current price is within the 38.2% - 61.8% Fib retracement zone."""
+    # Assumes df has Capitalized 'Close' column
     if not fib_levels or '38.2' not in fib_levels or '61.8' not in fib_levels:
         return False
     try:
@@ -195,6 +199,7 @@ def check_stage2_entry(df: pd.DataFrame, fib_levels: Dict[str, float]) -> bool:
 
 def filter_volume_thrust(df: pd.DataFrame, window: int = 50, multiplier: float = CONFIG.get("volume_thrust_multiple", 1.4)) -> bool:
     """Check if the latest volume is significantly above its moving average."""
+    # Assumes df has Capitalized 'Volume' column
     if 'Volume' not in df.columns or len(df) < window + 1:
         return False
     try:
@@ -215,6 +220,7 @@ def filter_volume_thrust(df: pd.DataFrame, window: int = 50, multiplier: float =
 
 def calculate_stage2_score(df: pd.DataFrame, fib_levels: Dict[str, float], vol_window: int = 50) -> float:
     """Calculate a score (0-100) indicating the quality of the Stage 2 setup."""
+    # Assumes df has Capitalized 'Close', 'Volume', potentially 'MA10'
     score = 0.0
     if not fib_levels:
         return score
@@ -245,6 +251,7 @@ def calculate_stage2_score(df: pd.DataFrame, fib_levels: Dict[str, float], vol_w
             score += volume_score
 
         # 3. Recent Momentum Score (Max 20 points - e.g., price > MA10)
+        # Assumes MA10 is Capitalized if present
         if 'Close' in df.columns and 'MA10' not in df.columns: # Calculate MA10 if missing
              df['MA10'] = df['Close'].rolling(10, min_periods=5).mean()
 
@@ -283,7 +290,7 @@ def screen_stage2_candidates(
         return []
 
     print(f"Starting Stage 2 scan for {len(tickers)} tickers...")
-    # Use robust data fetching
+    # Use robust data fetching (assumes get_price_data returns df with Capitalized cols)
     data = get_price_data(tickers, period=period, interval=interval)
 
     if data is None or data.empty:
@@ -291,42 +298,50 @@ def screen_stage2_candidates(
         return []
 
     candidates = []
-    symbols_in_data = data.columns.levels[0] if isinstance(data.columns, pd.MultiIndex) else tickers
+    # Determine symbols present in the fetched data
+    symbols_in_data = []
+    if isinstance(data.columns, pd.MultiIndex):
+        symbols_in_data = list(data.columns.levels[0])
+    elif not data.empty and len(tickers) == 1: # Handle case where yfinance might return flat for single ticker
+         symbols_in_data = tickers
+         # Ensure data is wrapped in MultiIndex for consistent processing below
+         data.columns = pd.MultiIndex.from_product([tickers, data.columns])
+
 
     for t in symbols_in_data:
+        if t not in tickers: continue # Only process requested tickers that were found
         try:
-            # Extract symbol data
-            if isinstance(data.columns, pd.MultiIndex):
-                df = data[t].copy()
-            else:
-                df = data.copy() if t == symbols_in_data[0] else pd.DataFrame()
+            # Extract symbol data (already Capitalized from get_price_data)
+            df = data[t].copy()
+            # df.columns = [col.strip() for col in df.columns] # Columns should already be Capitalized/clean
 
-            df.columns = [col.strip() for col in df.columns] # Clean column names
-            df = df.dropna(subset=['Close']) # Ensure Close price exists
+            # Ensure necessary columns exist and drop rows with NaN Close
+            if 'Close' not in df.columns: continue
+            df = df.dropna(subset=['Close'])
 
             if len(df) < max(downtrend_window, downtrend_days, swing_lookback * 2):
                 continue # Skip if insufficient data
 
-            # 1. Check for prior downtrend
+            # 1. Check for prior downtrend (functions expect Capitalized cols)
             df = compute_sma_slope(df, downtrend_window)
             if not filter_downtrend(df, downtrend_window, downtrend_days):
                 continue
 
-            # 2. Find relevant swing points
+            # 2. Find relevant swing points (expects Capitalized 'Close')
             high_idx, low_idx = find_swings(df, swing_lookback)
             if not high_idx or not low_idx:
                 continue
 
-            # 3. Calculate Fibonacci levels
+            # 3. Calculate Fibonacci levels (expects Capitalized 'Close')
             fib_levels = compute_fib_levels(df, high_idx, low_idx)
             if not fib_levels:
                 continue
 
-            # 4. Check if current price is in the Stage 2 entry zone
+            # 4. Check if current price is in the Stage 2 entry zone (expects Capitalized 'Close')
             if not check_stage2_entry(df, fib_levels):
                 continue
 
-            # 5. Check for volume confirmation (thrust)
+            # 5. Check for volume confirmation (thrust) (expects Capitalized 'Volume')
             if not filter_volume_thrust(df, vol_window, vol_mult):
                 continue
 
@@ -336,9 +351,11 @@ def screen_stage2_candidates(
                  # Include Fib levels in output for potential analysis/plotting
                  candidates.append((t, score, fib_levels))
 
+        except KeyError as e:
+             print(f"KeyError processing {t} for Stage 2 (likely missing column): {e}", file=sys.stderr)
         except Exception as e:
             print(f"Error processing {t} for Stage 2: {e}", file=sys.stderr)
-            # traceback.print_exc() # Uncomment for debugging
+            traceback.print_exc() # Print full traceback for debugging
             continue
 
     # Sort candidates by score (descending)
