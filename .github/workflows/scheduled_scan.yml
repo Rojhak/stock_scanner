@@ -57,4 +57,4 @@ jobs:
           LS_TO_EMAILS: ${{ secrets.LS_TO_EMAILS }}
         run: |
           # Run the wrapper script from the root of the checkout
-          python run_scheduled_scan.py
+          python leader_scan.run_scheduled_scan
