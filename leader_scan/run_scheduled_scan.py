@@ -91,19 +91,22 @@ def main():
     # Check for essential email config from environment variables/secrets
     if not all([CONFIG.get("smtp_host"), CONFIG.get("smtp_user"), CONFIG.get("smtp_password"), CONFIG.get("from_email"), CONFIG.get("to_emails")]):
         log.error("Email configuration incomplete via ENV VARS (LS_...). Cannot send alert.")
-        # Exit cleanly if config is missing in a scheduled run
         sys.exit(1)
 
     log.info(f"Running standard leader scan (Top {TOP_N}, Benchmark {BENCHMARK})...")
-    # Call the function from main.py, ensure it returns results
     leader_results = run_scan_for_all_universes(top_per_universe=TOP_N, benchmark=BENCHMARK, return_results=True)
 
     log.info(f"Running advanced scan (Top {TOP_N}, Type {ADVANCED_SETUP_TYPE_FILTER}, Benchmark {BENCHMARK})...")
-    # Call the function from advanced_screener.py with the specific type filter
-        # <<< --- ADD THIS DEBUG LINE --- >>>
-    log.info(f"DEBUG: Value being passed as setup_type_filter is: '{ADVANCED_SETUP_TYPE_FILTER}'")
-        # <<< --- END DEBUG LINE --- >>>
     advanced_results = run_advanced_scan_for_all(top_per_universe=TOP_N, setup_type_filter=ADVANCED_SETUP_TYPE_FILTER, benchmark=BENCHMARK, return_results=True)
+
+    # Add debug logs for intermediate results
+    log.debug(f"Leader Results: {leader_results}")
+    log.debug(f"Advanced Results: {advanced_results}")
+
+    # Validate for duplicate results
+    if leader_results == advanced_results:
+        log.warning("Leader and Advanced scan results are identical. Skipping duplicate results in email.")
+        advanced_results = None  # Skip advanced results if they are identical
 
     log.info("Formatting email body...")
     today_str = dt.date.today().strftime('%Y-%m-%d')
@@ -116,9 +119,10 @@ def main():
     email_body += format_results_for_email(leader_results, "Standard Leader Scan", DISPLAY_COLS_LEADER)
     email_body += "="*40 + "\n\n"
 
-    # Format Advanced Scan (MA_CROSS) Results
-    email_body += format_results_for_email(advanced_results, f"Advanced Scan ({ADVANCED_SETUP_TYPE_FILTER})", DISPLAY_COLS_ADV)
-    email_body += "="*40 + "\n"
+    # Format Advanced Scan Results (if not skipped)
+    if advanced_results:
+        email_body += format_results_for_email(advanced_results, f"Advanced Scan ({ADVANCED_SETUP_TYPE_FILTER})", DISPLAY_COLS_ADV)
+        email_body += "="*40 + "\n"
 
     # Send Email using dispatch function from alert.py
     log.info(f"Attempting to send combined email alert to: {CONFIG.get('to_emails')}")
@@ -127,10 +131,6 @@ def main():
         log.info("Combined email alert dispatched successfully.")
     except Exception as e:
         log.error(f"Failed to send combined email alert: {e}", exc_info=True)
-        # Exit with error if email dispatch fails in scheduled run
         sys.exit(1)
 
     log.info("Scheduled scan run finished successfully.")
-
-if __name__ == "__main__":
-    main()
