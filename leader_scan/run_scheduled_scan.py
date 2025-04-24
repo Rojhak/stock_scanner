@@ -135,4 +135,5 @@ def main():
 
     log.info("Scheduled scan run finished successfully.")
     if __name__ == "__main__":
+        print("--- DEBUG: Entered __main__ block, calling main() ---", flush=True) # Add this line
         main()
