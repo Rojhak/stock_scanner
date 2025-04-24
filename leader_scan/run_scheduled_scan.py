@@ -130,6 +130,11 @@ def main():
         dispatch(subject, email_body)
         log.info("Combined email alert dispatched successfully.")
     except Exception as e:
+        # ADD THIS PRINT:
+        print(f"--- FATAL ERROR DURING IMPORT: {type(e).__name__}: {e} ---", flush=True)
+        # Keep original logging and exit:
+        log.critical(f"Unexpected error during imports: {e}", exc_info=True)
+        sys.exit(1)
         log.error(f"Failed to send combined email alert: {e}", exc_info=True)
         sys.exit(1)
 
