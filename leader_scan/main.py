@@ -16,6 +16,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path # Import needed
 import os
 import numpy as np
+import time
 
 # Setup basic logging
 log_level = logging.INFO
@@ -87,26 +88,56 @@ def _calculate_required_indicators(df: pd.DataFrame, bench_close: Optional[pd.Se
             else: df_out[rsi_col] = np.nan
 
         # Relative Strength (using lowercase 'close' and benchmark close)
-        rs_line_col = 'rs_line'; rs_slope_col = 'rs_slope'
-        if bench_close is not None and not bench_close.empty and close_col in df_out.columns and not df_out[close_col].isnull().all():
-             log.debug(f"Calculating RS_Line using benchmark data...")
-             if rs_line_col not in df_out.columns:
-                  # Ensure benchmark series index aligns with df_out index
-                  aligned_bench = bench_close.reindex(df_out.index)
-                  if not aligned_bench.isnull().all():
-                      df_out[rs_line_col] = rs_line(df_out[close_col], aligned_bench, smooth=5)
-                  else:
-                      df_out[rs_line_col] = np.nan; log.debug("Aligned benchmark all NaNs.")
-             else: df_out[rs_line_col].fillna(method='ffill', inplace=True) # Forward fill existing RS line if needed
+        # --- Corrected Code for main.py ---
+        rs_line_col = 'rs_line'; rs_slope_col = 'rs_slope' # Define column names (lowercase)
 
-             # Calculate RS slope if RS line exists
-             if rs_line_col in df_out.columns and rs_slope_col not in df_out.columns:
-                  if not df_out[rs_line_col].isnull().all():
-                      df_out[rs_slope_col] = df_out[rs_line_col].diff(5) # Simple 5-day slope
-                  else: df_out[rs_slope_col] = np.nan
+        calculate_rs = False # Flag to control calculation flow
+        # First, check if bench_close Series exists and is not None
+        if bench_close is not None:
+            # Now check if it's not empty AND the stock's close column exists and has data
+            # Use .any() or .all() for Series boolean checks if needed, but .empty is usually sufficient here
+            if not bench_close.empty and close_col in df_out.columns and not df_out[close_col].isnull().all():
+                calculate_rs = True
+            else:
+                log.debug(f"Skipping RS Calcs (Benchmark empty or stock '{close_col}' invalid/empty)")
         else:
-            log.debug(f"Skipping RS Calcs (Benchmark valid: {bench_close is not None and not bench_close.empty}, Close valid: {close_col in df_out.columns and not df_out[close_col].isnull().all()})")
-            df_out[rs_line_col] = np.nan; df_out[rs_slope_col] = np.nan
+            log.debug(f"Skipping RS Calcs (Benchmark Series is None)")
+
+        # Proceed with RS calculation ONLY if the checks passed
+        if calculate_rs:
+            log.debug(f"Calculating RS_Line using benchmark data...")
+            if rs_line_col not in df_out.columns:
+                aligned_bench = bench_close.reindex(df_out.index) # Align benchmark to stock data index
+                if not aligned_bench.isnull().all():
+                    # Calculate RS Line (ensure function 'rs_line' handles potential errors)
+                    df_out[rs_line_col] = rs_line(df_out[close_col], aligned_bench, smooth=5) # Pass lowercase 'close'
+
+                    # Calculate RS slope ONLY if rs_line was successfully computed and is not all NaN
+                    if rs_slope_col not in df_out.columns and rs_line_col in df_out.columns and not df_out[rs_line_col].isnull().all():
+                        df_out[rs_slope_col] = df_out[rs_line_col].diff(5) # Simple 5-day slope
+                    # Ensure slope column exists even if calculation failed (e.g., rs_line was all NaN)
+                    elif rs_slope_col not in df_out.columns:
+                        df_out[rs_slope_col] = np.nan
+                else:
+                    # If aligned benchmark is all NaN, set RS cols to NaN
+                    df_out[rs_line_col] = np.nan
+                    if rs_slope_col not in df_out.columns: df_out[rs_slope_col] = np.nan
+                    log.debug("Aligned benchmark resulted in all NaNs for RS Line calc.")
+            # If rs_line_col already exists (e.g. from cache), you might still want to calculate slope
+            elif rs_slope_col not in df_out.columns and rs_line_col in df_out.columns and not df_out[rs_line_col].isnull().all():
+                log.debug(f"Calculating RS Slope from existing RS Line column.")
+                df_out[rs_slope_col] = df_out[rs_line_col].diff(5)
+
+
+        else:
+            # If RS calculation is skipped entirely, ensure the columns exist with NaN
+            log.debug(f"Skipping RS Calcs (Condition calculate_rs={calculate_rs})")
+            if rs_line_col not in df_out.columns: df_out[rs_line_col] = np.nan
+            if rs_slope_col not in df_out.columns: df_out[rs_slope_col] = np.nan
+
+        # Ensure the rest of the indicator calculations (like ATR, RSI etc.) happen correctly
+        # Ensure the final rename back to Capitalized columns happens AFTER this block
+        # --- End of Corrected Code ---
 
         log.debug(f"Finished indicators. Lowercase cols: {df_out.columns.tolist()}")
     except Exception as e: log.warning(f"Error during indicator calculation: {e}", exc_info=True)
