@@ -134,3 +134,5 @@ def main():
         sys.exit(1)
 
     log.info("Scheduled scan run finished successfully.")
+    if __name__ == "__main__":
+        main()
