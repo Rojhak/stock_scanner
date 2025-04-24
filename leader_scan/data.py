@@ -1,317 +1,393 @@
-# leader_scan/data.py
+# leader_scan/main.py
 """
-Data ingestion helpers for the leader_scan package.
-Includes file-based and in-memory caching, and batch downloading.
+Main orchestrator for the Leader Scan package.
+Provides high-level functions to run scans and the LeadershipScanner class.
 """
+from __future__ import annotations
 
+import argparse
 import datetime as dt
-import pathlib
-from pathlib import Path # Ensure Path is imported
 import sys
+import traceback
 import logging
-import hashlib
-from typing import Iterable, List, Dict, Any, Optional, Union
-import time # Import the time module for delays
-
 import pandas as pd
-try:
-    import yfinance as yf
-except ImportError:
-    print("Warning: yfinance library not found. Please install it (`pip install yfinance`) to fetch price data.", file=sys.stderr)
-    yf = None
-# Try importing pyarrow for parquet caching, but don't make it a hard requirement
-try:
-    import pyarrow
-except ImportError:
-    print("Warning: pyarrow library not found. File caching (.parquet) will be disabled.", file=sys.stderr)
-    pyarrow = None # Set to None if not found
+from typing import List, Optional, Dict, Any, Tuple
+from pathlib import Path # Import needed
+import os
+import numpy as np
 
-# Import config here to use flags if needed
-try:
-    from .config import CONFIG
-except ImportError:
-    CONFIG = {} # Minimal fallback
-
+# Setup basic logging
+log_level = logging.INFO
+logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True)
 log = logging.getLogger(__name__)
 
-# --- In-Memory Cache ---
-_memory_cache: Dict[str, pd.DataFrame] = {}
-# -----------------------
-
-# --------------------------------------------------------------------------- #
-# Configuration and File Cache Path
-# --------------------------------------------------------------------------- #
-_PACKAGE_ROOT = Path(__file__).resolve().parent
-_CACHE_DIR = _PACKAGE_ROOT.parent / ".cache" # Place .cache outside package
+# --- Imports from within the package ---
 try:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True) # Ensure parent dirs exist
-except OSError as e:
-    log.warning(f"Could not create cache directory at {_CACHE_DIR}: {e}")
-    _CACHE_DIR = _PACKAGE_ROOT / ".cache_fallback" # Fallback inside package
+    from .config import CONFIG
+    from .data import get_price_data, get_fundamentals, load_universe
+    from .scorer import score_dataframe, score_symbol # Scorer expects Capitalized cols
+    from .alert import dispatch
+    from .indicators import atr, ma, ema, rs_line, rs_new_high # Indicators expect lowercase cols
+except ImportError as e:
+    log.critical(f"Failed to import necessary modules from leader_scan package: {e}. Exiting.")
+    sys.exit(1)
+
+# Define package root relative to this file for resource loading
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+
+# --- Internal Helper Functions ---
+
+def _calculate_required_indicators(df: pd.DataFrame, bench_close: Optional[pd.Series] = None) -> pd.DataFrame:
+    """
+    Calculate indicators. Input df has Capitalized columns.
+    Standardizes to lowercase internally for calculations, then renames back.
+    """
+    if df.empty: return df
+    df_out = df.copy()
+    df_out.columns = [str(col).lower() for col in df_out.columns]
+    log.debug(f"Calculating indicators. Lowercase columns: {df_out.columns.tolist()}")
+    required_cols_lower = ['open', 'high', 'low', 'close', 'volume']
+    close_col, high_col, low_col = 'close', 'high', 'low'
+    if not all(col in df_out.columns for col in required_cols_lower):
+         missing_cols = [rc for rc in required_cols_lower if rc not in df_out.columns]
+         log.warning(f"Missing required OHLCV columns (lowercase): {missing_cols}.")
+
     try:
-         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-         log.warning(f"Using fallback cache directory: {_CACHE_DIR}")
-    except OSError as e_fallback:
-         log.error(f"Could not create fallback cache directory: {e_fallback}. File caching disabled.")
-         _CACHE_DIR = None
+        # Moving Averages
+        for window in [10, 20, 50, 200]:
+            ma_col = f"ma{window}"
+            if ma_col not in df_out.columns:
+                if close_col in df_out.columns and pd.api.types.is_numeric_dtype(df_out[close_col]): df_out[ma_col] = ma(df_out[close_col], window)
+                else: df_out[ma_col] = np.nan
+        # ATR
+        atr_col = 'atr'
+        if atr_col not in df_out.columns:
+            if all(c in df_out.columns for c in [high_col, low_col, close_col]) and not df_out[[high_col, low_col, close_col]].isnull().all().all():
+                 ohlc_data_for_atr = df_out[[high_col, low_col, close_col]].dropna()
+                 if not ohlc_data_for_atr.empty: df_out[atr_col] = atr(ohlc_data_for_atr, window=14).reindex(df_out.index)
+                 else: df_out[atr_col] = np.nan
+            else: df_out[atr_col] = np.nan
+        # RSI
+        rsi_col = 'rsi'
+        if rsi_col not in df_out.columns:
+            if close_col in df_out.columns and pd.api.types.is_numeric_dtype(df_out[close_col]) and not df_out[close_col].isnull().all():
+                 delta = df_out[close_col].diff(); up = delta.clip(lower=0); down = -delta.clip(upper=0)
+                 ma_up = up.ewm(com=13, adjust=False).mean(); ma_down = down.ewm(com=13, adjust=False).mean()
+                 rs = ma_up / ma_down.replace(0, np.nan)
+                 df_out[rsi_col] = 100.0 - (100.0 / (1.0 + rs)); df_out[rsi_col] = df_out[rsi_col].fillna(50)
+            else: df_out[rsi_col] = np.nan
 
-_DEFAULT_CACHE_DAYS = CONFIG.get("cache_days", 730)
-
-# --------------------------------------------------------------------------- #
-# Price Data Functions
-# --------------------------------------------------------------------------- #
-def _generate_ticker_hash(tickers: Iterable[str]) -> str:
-    """Generates a SHA256 hash from a sorted list of tickers."""
-    ticker_string = "_".join(sorted(str(t) for t in tickers))
-    return hashlib.sha256(ticker_string.encode('utf-8')).hexdigest()[:16]
-
-def _get_cache_key(
-    tickers: Iterable[str], start_date: dt.date, end_date: dt.date,
-    interval: str, universe_name: Optional[str] = None
-) -> Optional[Path]:
-    """Generates file cache key. Returns None if file caching disabled."""
-    if _CACHE_DIR is None or pyarrow is None: log.debug("File cache key skipped."); return None
-    date_format = "%Y%m%d"
-    ticker_list = list(tickers) if tickers else []
-    if universe_name:
-         safe_name = "".join(c if c.isalnum() else '_' for c in universe_name); base_name = safe_name[:50]
-    elif ticker_list and len(ticker_list) == 1:
-         safe_ticker = "".join(c if c.isalnum() else '_' for c in str(ticker_list[0])); base_name = safe_ticker[:50]
-    else: base_name = f"tickers_{_generate_ticker_hash(ticker_list)}"
-    key = f"{base_name}_{start_date.strftime(date_format)}_{end_date.strftime(date_format)}_{interval}.parquet"
-    return _CACHE_DIR / key
-
-def clear_memory_cache():
-    """Clears the in-memory data cache."""
-    global _memory_cache
-    _memory_cache = {}
-    log.info("In-memory data cache cleared.")
-
-def get_price_data(
-    tickers: Union[str, List[str]], *, start_date: Optional[dt.date] = None,
-    end_date: Optional[dt.date] = None, interval: str = "1d",
-    force_download: bool = False, universe_name_for_cache: Optional[str] = None
-) -> Optional[pd.DataFrame]:
-    """
-    Downloads OHLCV data using yfinance, with batching, delays, caching, and validation.
-
-    Returns CAPITALIZED column names (Open, High, Low, Close, Volume, Adj Close).
-    """
-    global _memory_cache
-
-    # --- Input validation and date calculation ---
-    if yf is None: log.error("yfinance not installed."); return None
-    if isinstance(tickers, str): tickers_list = [s.strip().upper() for s in tickers.replace(",", " ").split() if s.strip()]
-    elif isinstance(tickers, list): tickers_list = [s.strip().upper() for s in tickers if isinstance(s, str) and s.strip()]
-    else: log.error(f"Invalid type for 'tickers': {type(tickers)}."); return None
-    if not tickers_list: log.warning("No valid tickers provided."); return pd.DataFrame()
-    today = dt.date.today(); final_end_date = end_date or today
-    final_start_date = start_date or (final_end_date - dt.timedelta(days=_DEFAULT_CACHE_DAYS))
-    global_force_download = CONFIG.get('force_download_flag', False)
-    if global_force_download: force_download = True; log.info("Forcing download due to flag.")
-
-    # --- Create unique key for caching ---
-    cache_key_tuple = (tuple(sorted(tickers_list)), final_start_date, final_end_date, interval)
-    cache_key_str = str(cache_key_tuple)
-
-    # --- 1. Check In-Memory Cache ---
-    if not force_download and cache_key_str in _memory_cache:
-        log.debug(f"Loading data from memory cache for key (approx): {tickers_list[:2]}...")
-        return _memory_cache[cache_key_str].copy()
-
-    # --- 2. Check File Cache (Parquet) ---
-    cache_file = _get_cache_key(tickers_list, final_start_date, final_end_date, interval,
-                                universe_name=universe_name_for_cache or (tickers_list[0] if len(tickers_list) == 1 else None))
-    if not force_download and cache_file and cache_file.exists() and cache_file.is_file():
-        try:
-            log.debug(f"Loading cached data from file: {cache_file}")
-            df = pd.read_parquet(cache_file)
-            if not df.empty:
-                expected_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-                if isinstance(df.columns, pd.MultiIndex): actual_cols = list(df.columns.levels[1]) if len(df.columns.levels) > 1 else []
-                else: actual_cols = list(df.columns)
-                if all(col in actual_cols for col in expected_cols):
-                    log.debug(f"File cache validated for {cache_file}.")
-                    _memory_cache[cache_key_str] = df # Store in memory
-                    return df.copy() # Return copy
-                else: log.warning(f"Cached file {cache_file} missing columns ({actual_cols}). Forcing download."); force_download = True
-            else: log.warning(f"Cached file {cache_file} is empty. Forcing download."); force_download = True
-        except ImportError: log.warning("pyarrow not installed. Cannot read file cache.")
-        except Exception as e: log.error(f"Error reading cache file {cache_file}: {e}. Forcing download.", exc_info=False); force_download = True
-
-    # --- 3. Download Data (with Batching) ---
-    if force_download or cache_key_str not in _memory_cache:
-        log.info(f"Fetching/Downloading price data via yfinance for {len(tickers_list)} tickers...")
-        df_downloaded = None; yf_exception = None
-        all_batch_data = [] # Store results from successful batches
-        batch_size = 50  # Adjust as needed (50-100 is often reasonable)
-        delay_between_batches = 2 # Seconds (adjust based on testing/rate limits)
-
-        try:
-            num_batches = (len(tickers_list) + batch_size - 1) // batch_size
-            for i in range(0, len(tickers_list), batch_size):
-                batch = tickers_list[i:i + batch_size]
-                current_batch_num = i//batch_size + 1
-                log.info(f"Fetching batch {current_batch_num}/{num_batches}: ({len(batch)} tickers starting with {batch[0]}...)")
-                try:
-                    df_batch = yf.download(tickers=" ".join(batch), start=final_start_date,
-                                           end=final_end_date + dt.timedelta(days=1), interval=interval,
-                                           group_by="ticker", auto_adjust=False, prepost=False,
-                                           threads=True, progress=False, ignore_tz=True)
-
-                    if not df_batch.empty and isinstance(df_batch.columns, pd.MultiIndex):
-                        # Filter out tickers that returned only NaNs immediately
-                        valid_batch_data = {}
-                        for ticker in df_batch.columns.levels[0]:
-                            # Ensure the ticker was actually requested in this batch
-                            # and yfinance didn't return extra due to similar names
-                            if ticker in batch and not df_batch[ticker].isnull().all().all():
-                                 valid_batch_data[ticker] = df_batch[ticker]
-                        if valid_batch_data:
-                             # Concatenate valid data for this batch
-                             all_batch_data.append(pd.concat(valid_batch_data, axis=1))
-                             log.debug(f"Batch {current_batch_num} successful for {len(valid_batch_data)} tickers.")
-                        else: log.warning(f"No valid data obtained in batch {current_batch_num} (started with {batch[0]}).")
-                    elif df_batch.empty:
-                         log.warning(f"Empty DataFrame returned for batch {current_batch_num} (started with {batch[0]}).")
-                    else:
-                         log.warning(f"Unexpected non-MultiIndex DataFrame returned for batch {current_batch_num}. Discarding batch.")
-
-                except Exception as e_batch:
-                    log.error(f"Download failed for batch {current_batch_num} (started with {batch[0]}): {type(e_batch).__name__} - {e_batch}", exc_info=False) # Log batch error but continue
-
-                # Delay between batches (except after the last one)
-                if current_batch_num < num_batches:
-                     log.debug(f"Waiting {delay_between_batches}s before next batch...")
-                     time.sleep(delay_between_batches)
-
-            # Combine batch results
-            if all_batch_data:
-                df_downloaded = pd.concat(all_batch_data, axis=1)
-                # Sort columns by ticker name (level 0) for consistency
-                df_downloaded = df_downloaded.sort_index(axis=1, level=0)
-                log.info(f"Successfully combined data for {len(df_downloaded.columns.levels[0])} tickers from {num_batches} batches.")
-            else:
-                log.error("No valid data downloaded from any batch.")
-                df_downloaded = pd.DataFrame() # Ensure empty df if all batches failed
-
-        except Exception as e_concat: # Catch errors during concat or main loop
-            yf_exception = e_concat
-            log.error(f"Exception during batch processing/concatenation: {type(e_concat).__name__} - {e_concat}", exc_info=True)
-            df_downloaded = pd.DataFrame() # Ensure empty df on critical error
-
-        # --- Post-Download Validation & Standardization (Applied to Concatenated DF) ---
-        if df_downloaded is None or df_downloaded.empty:
-            log.warning(f"No data obtained after batch download attempts for: {', '.join(tickers_list)}")
-            df_processed = pd.DataFrame()
+        # Relative Strength
+        rs_line_col = 'rs_line'; rs_slope_col = 'rs_slope'
+        # *** MODIFIED IF CONDITION ***
+        can_calc_rs = (
+            bench_close is not None
+            and not bench_close.empty
+            and close_col in df_out.columns
+            and df_out[close_col].notnull().any() # Check if *any* close price is not null
+        )
+        if can_calc_rs:
+             log.debug(f"Calculating RS_Line using benchmark data...")
+             if rs_line_col not in df_out.columns:
+                  aligned_bench = bench_close.reindex(df_out.index)
+                  if not aligned_bench.isnull().all(): df_out[rs_line_col] = rs_line(df_out[close_col], aligned_bench, smooth=5)
+                  else: df_out[rs_line_col] = np.nan; log.debug("Aligned benchmark all NaNs.")
+             else: df_out[rs_line_col].fillna(method='ffill', inplace=True)
+             if rs_line_col in df_out.columns and rs_slope_col not in df_out.columns:
+                  if not df_out[rs_line_col].isnull().all(): df_out[rs_slope_col] = df_out[rs_line_col].diff(5)
+                  else: df_out[rs_slope_col] = np.nan
         else:
-            log.debug("Processing final concatenated DataFrame...")
-            successful_tickers = []; df_processed = pd.DataFrame(); expected_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-            if isinstance(df_downloaded.columns, pd.MultiIndex):
-                valid_tickers_data = {}
-                downloaded_tickers = df_downloaded.columns.get_level_values(0).unique()
-                for ticker in downloaded_tickers:
-                     # Ensure we only keep tickers originally requested
-                     if ticker in tickers_list:
-                         ticker_df = df_downloaded[ticker].copy()
-                         ticker_df.columns = [str(c).strip().capitalize() for c in ticker_df.columns] # Standardize
-                         if all(col in ticker_df.columns for col in expected_cols):
-                             # Drop rows where Close is NaN *after* standardization
-                             valid_ticker_df = ticker_df.dropna(subset=['Close'])
-                             if not valid_ticker_df.empty:
-                                  valid_tickers_data[ticker] = valid_ticker_df
-                                  successful_tickers.append(ticker)
-                             else: log.debug(f"{ticker} empty after dropna(Close).")
-                         else: log.warning(f"{ticker} missing std cols after batch concat: {ticker_df.columns.tolist()}. Skipping.")
-                # Log tickers requested but not in final valid data
-                failed_tickers = [t for t in tickers_list if t not in successful_tickers]
-                if failed_tickers: log.warning(f"Tickers with no valid/processed data: {', '.join(failed_tickers)}")
-                # Re-concatenate only the valid, processed data
-                if valid_tickers_data: df_processed = pd.concat(valid_tickers_data, axis=1).sort_index(axis=1, level=0)
-                else: log.error("No valid data remains after processing concatenated batches."); df_processed = pd.DataFrame()
-            else: log.error(f"Final downloaded df has unexpected structure (not MultiIndex). Cols: {df_downloaded.columns}")
+            log.debug(f"Skipping RS Calcs (Benchmark valid: {bench_close is not None and not bench_close.empty}, Close col valid: {close_col in df_out.columns and df_out[close_col].notnull().any()})")
+            df_out[rs_line_col] = np.nan; df_out[rs_slope_col] = np.nan
+        log.debug(f"Finished indicators. Lowercase cols: {df_out.columns.tolist()}")
+    except Exception as e: log.warning(f"Error indicator calc: {e}", exc_info=True)
 
-        # --- Cache and Return ---
-        if df_processed.empty: log.warning(f"Returning empty DataFrame for {', '.join(tickers_list)} after processing.")
-        # Cache the result (even if empty)
-        _memory_cache[cache_key_str] = df_processed
-        if cache_file:
-            try: df_processed.to_parquet(cache_file, compression="snappy")
-            except ImportError: log.warning("pyarrow not installed. Cannot save file cache.")
-            except Exception as e_save: log.error(f"Error saving cache file {cache_file}: {e_save}", exc_info=False)
-        # Return None only if there was a critical exception during download/concat
-        return None if yf_exception else df_processed.copy()
+    # --- Rename columns back to Capitalized ---
+    rename_map = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume', 'adj close': 'Adj Close',
+                  'ma10': 'MA10', 'ma20': 'MA20', 'ma50': 'MA50', 'ma200': 'MA200', 'atr': 'ATR', 'rsi': 'RSI',
+                  'rs_line': 'RS_Line', 'rs_slope': 'RS_slope'}
+    final_rename_map = {k: v for k, v in rename_map.items() if k in df_out.columns}
+    df_out.rename(columns=final_rename_map, inplace=True)
+    log.debug(f"Cols after renaming back: {df_out.columns.tolist()}")
+    return df_out
 
-    # Fallback if logic path is unexpected (e.g., failed cache read didn't force download)
-    log.warning("Returning None from get_price_data (unexpected execution path).")
-    return None
+# Corrected _fetch_and_prepare_data with robust benchmark handling
+def _fetch_and_prepare_data(symbols: List[str], benchmark: str = "SPY", period: str = '2y', interval: str = '1d', universe_name: Optional[str] = None) -> Tuple[Optional[Dict[str, pd.DataFrame]], Optional[pd.Series]]:
+    """Fetches price data, prepares benchmark close. Handles MultiIndex benchmark."""
+    log.info(f"Fetching data: {len(symbols)} symbols (Universe: {universe_name or 'N/A'}), Benchmark: {benchmark}...")
+    today = dt.date.today(); start_date = today - dt.timedelta(days=CONFIG.get("cache_days", 730))
+    if 'y' in period: try: years = int(period.replace('y','')); start_date = today - dt.timedelta(days=years*365); except ValueError: pass
+    elif 'm' in period: try: months = int(period.replace('m','')); start_date = today - dt.timedelta(days=months*30); except ValueError: pass
 
-# --- Fundamentals Function ---
-def get_fundamentals(ticker: str) -> Dict[str, Any]:
-    """Retrieves basic fundamental data using yfinance Ticker info."""
-    if yf is None: log.error("yfinance not installed, cannot get fundamentals."); return {}
-    fundamentals = {}; tkr = yf.Ticker(ticker)
-    try: info = tkr.info
-    except Exception as e: log.warning(f"Could not get Ticker info for {ticker}: {e}"); info = {}
-    key_map = {"market_cap": "marketCap", "eps_ttm": "trailingEps", "pe_ratio": "trailingPE",
-               "ps_ratio": "priceToSalesTrailing12Months", "sector": "sector", "industry": "industry",
-               "currency": "currency", "shares_outstanding": "sharesOutstanding", "beta": "beta",
-               "dividend_yield": "dividendYield", "forward_pe": "forwardPE"}
-    for f_key, yf_key in key_map.items(): fundamentals[f_key] = info.get(yf_key)
-    try:
-         mcap = fundamentals.get("market_cap"); ps = fundamentals.get("ps_ratio")
-         if mcap is not None and ps is not None and ps != 0: fundamentals["sales_ttm"] = mcap / ps
-         else: fundamentals["sales_ttm"] = None
-    except Exception: fundamentals["sales_ttm"] = None
-    return fundamentals
+    # --- Fetch Benchmark Data ---
+    bench_df = get_price_data(benchmark, start_date=start_date, end_date=today, interval=interval, universe_name_for_cache=benchmark)
+    bench_close = None
+    if bench_df is None or bench_df.empty: log.warning(f"Failed benchmark fetch ({benchmark}).")
+    else:
+        log.debug(f"Benchmark ({benchmark}) cols: {bench_df.columns}"); log.debug(f"Benchmark ({benchmark}) head:\n{bench_df.head(2)}")
+        close_col_id = None # Can be tuple ('SPY','Close') or string 'Close'
+        if isinstance(bench_df.columns, pd.MultiIndex):
+             log.debug("Benchmark df has MultiIndex cols.")
+             if benchmark in bench_df.columns.get_level_values(0):
+                 price_level_values = bench_df[benchmark].columns
+                 log.debug(f"Benchmark price level columns: {price_level_values}")
+                 found_col_name = next((c for c in price_level_values if str(c) == 'Close'), None) or \
+                                  next((c for c in price_level_values if str(c).lower() == 'close'), None)
+                 if found_col_name: close_col_id = (benchmark, found_col_name); log.debug(f"Identified MultiIndex Close ID: {close_col_id}")
+                 else: log.warning(f"No 'Close'/'close' in price level of benchmark MultiIndex.")
+             else: log.warning(f"Benchmark ticker {benchmark} not in MultiIndex level 0.")
+        else:
+             log.debug("Benchmark df has flat columns.")
+             found_col_name = next((c for c in bench_df.columns if str(c) == 'Close'), None) or \
+                              next((c for c in bench_df.columns if str(c).lower() == 'close'), None)
+             if found_col_name: close_col_id = found_col_name; log.debug(f"Identified flat Close ID: {close_col_id}")
+             else: log.warning("No 'Close'/'close' in flat benchmark columns.")
 
-# --- Universe Loading Function ---
-def load_universe(name: str = "sp500") -> List[str]:
-    """Loads ticker symbols from a CSV file in resources directory."""
-    name_lower = name.lower().strip()
-    if not name_lower: raise ValueError("Universe name cannot be empty.")
-    csv_filename = f"{name_lower}.csv"
-    resources_dir = _PACKAGE_ROOT / "resources"
-    csv_path = resources_dir / csv_filename
-    log.info(f"Attempting to load universe '{name}' from: {csv_path}")
-    if not csv_path.exists() or not csv_path.is_file():
-        resources_dir_alt = _PACKAGE_ROOT.parent / "resources" # Fallback check
-        csv_path_alt = resources_dir_alt / csv_filename
-        if csv_path_alt.exists() and csv_path_alt.is_file(): log.warning(f"Using universe file from parent: {csv_path_alt}"); csv_path = csv_path_alt
-        else: raise ValueError(f"Universe CSV file not found at {csv_path} or {csv_path_alt}")
+        if close_col_id is not None:
+            try:
+                log.debug(f"Attempting extraction using ID: {close_col_id}")
+                extracted_series = bench_df[close_col_id]
+                log.debug(f"Extracted series type: {type(extracted_series)}, dtype: {extracted_series.dtype}")
+                log.debug(f"Extracted series head:\n{extracted_series.head(3)}")
+                is_null = extracted_series.isnull().all(); is_numeric = pd.api.types.is_numeric_dtype(extracted_series)
+                log.debug(f"Validation: Is Null = {is_null}, Is Numeric = {is_numeric}")
+                if is_null: log.warning(f"Benchmark column ({close_col_id}) all NaNs."); bench_close = None
+                elif not is_numeric: log.warning(f"Benchmark column ({close_col_id}) not numeric."); bench_close = None
+                else: bench_close = extracted_series; log.info(f"OK: Benchmark Close extracted from: {close_col_id}")
+            except Exception as e: log.error(f"Error extracting benchmark column ({close_col_id}): {e}", exc_info=True); bench_close = None
+        else: log.error(f"Could not find 'Close' column identifier in benchmark {benchmark}.")
 
-    symbols_list = []; df = pd.DataFrame()
-    try:
-        try: df = pd.read_csv(csv_path, delimiter=',', encoding='utf-8', on_bad_lines='warn', skipinitialspace=True)
-        except UnicodeDecodeError: log.warning(f"UTF-8 failed for {csv_path}, trying latin1."); df = pd.read_csv(csv_path, delimiter=',', encoding='latin1', on_bad_lines='warn', skipinitialspace=True)
-        except pd.errors.ParserError as pe: raise ValueError(f"Error parsing CSV {csv_path}: {pe}") from pe
-        except Exception as read_err: raise ValueError(f"Error reading CSV {csv_path}: {read_err}") from read_err
-        if df.empty: log.warning(f"{csv_path} loaded empty."); return []
+    if bench_close is None: log.warning(f"Proceeding without benchmark data. RS calcs skipped.")
 
-        symbol_col = None
+    # --- Fetch Symbol Data ---
+    all_data = get_price_data(symbols, start_date=start_date, end_date=today, interval=interval, universe_name_for_cache=universe_name)
+    if all_data is None or all_data.empty: log.error(f"Failed symbol fetch for universe '{universe_name}'."); return None, bench_close
+
+    # --- Structure Symbol Data ---
+    data_dict: Dict[str, pd.DataFrame] = {}; successful_tickers = []
+    def standardize_columns(df):
+        new_cols = []; df.columns = [str(col).strip() for col in df.columns]
         for col in df.columns:
-            col_lower = str(col).strip().lower()
-            if col_lower in ['symbol', 'ticker', 'code', 'isin']: symbol_col = col; break
-        if symbol_col is None:
-            if len(df.columns) > 0: symbol_col = df.columns[0]; log.warning(f"No standard symbol column found. Using first column '{symbol_col}'.")
-            else: raise ValueError(f"No columns found in {csv_path}.")
+            if isinstance(col, str): new_cols.append(col.capitalize())
+            else: new_cols.append(col)
+        df.columns = new_cols
+        return df
 
-        symbols_raw = df[symbol_col].dropna().astype(str)
-        symbols_list_raw = symbols_raw.str.strip().str.upper().tolist()
-        symbols_list = []
-        skip_prefixes = ("PERF.", "KGV", "MARKT-", "KAUFEN", "VERKAUFEN", "#", "//")
-        skip_exact = {"SYMBOL", "TICKER", "ISIN", "NAME", "NAN", ""}
-        problem_chars = ('/', '^', '+', '*')
-        for s in symbols_list_raw:
-            if s in skip_exact or s.startswith(skip_prefixes) or any(char in s for char in problem_chars):
-                log.debug(f"Skipping invalid symbol: {s}"); continue
-            symbols_list.append(s) # Use symbol directly
+    if isinstance(all_data.columns, pd.MultiIndex):
+        successful_tickers = list(all_data.columns.levels[0])
+        log.debug(f"Data fetched for: {', '.join(successful_tickers)} in universe '{universe_name}'")
+        for sym in successful_tickers:
+            if sym in symbols:
+                 try:
+                     df_sym = all_data[sym].copy(); df_sym = standardize_columns(df_sym)
+                     if 'Close' in df_sym.columns: data_dict[sym] = df_sym.dropna(subset=['Close'])
+                     else: log.warning(f"Symbol {sym} missing 'Close'. Cols: {df_sym.columns}")
+                 except Exception as e: log.error(f"Error processing {sym}: {e}")
+    elif not all_data.empty and len(symbols) == 1 and symbols[0] in symbols:
+         sym = symbols[0]; successful_tickers.append(sym); df_sym = all_data.copy()
+         df_sym = standardize_columns(df_sym)
+         if 'Close' in df_sym.columns: data_dict[sym] = df_sym.dropna(subset=['Close'])
+         else: log.warning(f"Single symbol {sym} missing 'Close'. Cols: {df_sym.columns}")
+    else: log.warning(f"Unexpected data structure/empty result for universe '{universe_name}'. Cols: {all_data.columns}")
+    log.info(f"OK: Prepared data for {len(data_dict)} symbols in universe '{universe_name}'.")
+    return data_dict, bench_close
 
-        if not symbols_list: log.warning(f"No valid symbols extracted from {csv_path}."); return []
-        log.info(f"Successfully loaded {len(symbols_list)} symbols from {csv_path}.")
-        return symbols_list
-    except KeyError as e: raise ValueError(f"Column '{symbol_col}' not found: {e}") from e
-    except Exception as e: log.error(f"Error loading universe {csv_path}: {e}", exc_info=True); raise ValueError(f"Failed loading {csv_path}") from e
 
-# --- Explicit Export List ---
-__all__ = ["get_price_data", "get_fundamentals", "load_universe", "clear_memory_cache"]
+def _process_and_score_symbol(symbol: str, df: pd.DataFrame, bench_close: Optional[pd.Series]) -> Optional[pd.Series]:
+    """Calculates indicators and scores a single symbol's DataFrame."""
+    log.debug(f"Processing symbol: {symbol}")
+    required_rows = CONFIG.get("min_data_rows", 50)
+    if df.empty or len(df) < required_rows: log.debug(f"Skipping {symbol}: Insufficient data."); return None
+    try:
+        df_with_indicators = _calculate_required_indicators(df, bench_close) # Returns Capitalized
+        # Check for essential indicator validity after calculation
+        if 'ATR' not in df_with_indicators or df_with_indicators['ATR'].isnull().all(): log.warning(f"ATR failed {symbol}, skipping scoring."); return None
+
+        scored_results = score_dataframe(df_with_indicators) # Scorer expects Capitalized
+        if not scored_results.empty:
+            if isinstance(scored_results, pd.DataFrame): latest_result = scored_results.iloc[-1].copy(); latest_result['date'] = scored_results.index[-1]
+            elif isinstance(scored_results, pd.Series): latest_result = scored_results.copy(); latest_result['date'] = scored_results.name
+            else: log.error(f"Unexpected type from score_dataframe: {type(scored_results)}"); return None
+            latest_result['symbol'] = symbol
+            log.debug(f"Valid setup found for {symbol} on {latest_result['date']} score {latest_result.get('score', np.nan):.2f}")
+            return latest_result
+        else: log.debug(f"No valid setup for {symbol} after scoring."); return None
+    except Exception as e: log.error(f"Error processing {symbol}: {e}", exc_info=False); return None
+
+# --- Public API ---
+class LeadershipScanner:
+    """Orchestrates the stock scanning process."""
+    def __init__(self, universe: str = CONFIG.get("universe", "sp500"), benchmark: str = "SPY"):
+        log.info(f"Initializing Scanner: Universe='{universe}', Benchmark='{benchmark}'.")
+        self.universe_name = universe; self.benchmark_symbol = benchmark; self.symbols: List[str] = []
+        self.data: Dict[str, pd.DataFrame] = {}; self.benchmark_close: Optional[pd.Series] = None; self.results: Optional[pd.DataFrame] = None
+        try: self.symbols = load_universe(self.universe_name)
+        except ValueError as e: log.error(f"Failed load '{self.universe_name}': {e}")
+        if not self.symbols: log.warning(f"No symbols loaded for universe '{self.universe_name}'.")
+
+    def run(self, top: int = 20, min_score: float = 3.0, min_r: Optional[float] = None) -> pd.DataFrame:
+        log.info(f"Starting scan run for universe '{self.universe_name}'...")
+        if not self.symbols: log.warning("No symbols loaded."); return pd.DataFrame()
+        data_period = CONFIG.get("cache_days", 730); data_interval = CONFIG.get("price_interval", "1d")
+        fetched_data, benchmark_close_series = _fetch_and_prepare_data(
+            self.symbols, self.benchmark_symbol, period=f"{data_period}d",
+            interval=data_interval, universe_name=self.universe_name )
+        self.benchmark_close = benchmark_close_series
+
+        if not fetched_data: log.error("Data fetching failed."); return pd.DataFrame()
+        self.data = fetched_data; all_results = []
+        log.info(f"Scoring {len(self.data)} symbols for universe '{self.universe_name}'...")
+        for symbol, df in self.data.items():
+             result_series = _process_and_score_symbol(symbol, df, self.benchmark_close)
+             if result_series is not None: all_results.append(result_series)
+        if not all_results: log.info(f"No qualifying setups for '{self.universe_name}'."); self.results = pd.DataFrame(); return self.results
+        try:
+            results_df = pd.DataFrame(all_results)
+            if 'date' in results_df.columns: results_df = results_df.set_index('date')
+            if 'symbol' not in results_df.columns and results_df.index.name != 'symbol': log.warning("'symbol' column missing.")
+            elif results_df.index.name == 'symbol': results_df.reset_index(inplace=True)
+        except Exception as e: log.error(f"Error creating results DF: {e}", exc_info=True); return pd.DataFrame()
+        log.info(f"Found {len(results_df)} potential setups for '{self.universe_name}'.")
+        final_min_r = min_r if min_r is not None else CONFIG.get("min_r_multiple", 2.5)
+        if 'score' not in results_df.columns: results_df['score'] = np.nan
+        if 'r_multiple' not in results_df.columns: results_df['r_multiple'] = np.nan
+        filtered_df = results_df[(results_df['score'].fillna(0) >= min_score) & (results_df['r_multiple'].fillna(0) >= final_min_r)].copy()
+        if filtered_df.empty: log.info(f"No stocks met final criteria for '{self.universe_name}'."); self.results = pd.DataFrame(); return self.results
+        sort_cols = ['score', 'r_multiple']; ascending_order = [False, False]
+        if 'score' not in filtered_df.columns: sort_cols.remove('score'); ascending_order.pop(0)
+        if 'r_multiple' not in filtered_df.columns: sort_cols.remove('r_multiple'); ascending_order.pop(1)
+        if not sort_cols: leaders = filtered_df.head(top)
+        else: leaders = filtered_df.sort_values(sort_cols, ascending=ascending_order).head(top)
+        log.info(f"Scan complete for '{self.universe_name}'. Identified {len(leaders)} leaders.")
+        self.results = leaders; return leaders.reset_index()
+
+def run_daily_scan(
+    universe: str = CONFIG.get("universe", "sp500"), top: int = 20, alert: bool = False,
+    silent: bool = False, benchmark: str = "SPY") -> pd.DataFrame:
+    """Convenience one-liner function to run the daily scan for a SINGLE universe."""
+    log.info(f"Executing run_daily_scan: universe='{universe}', top={top}, alert={alert}, silent={silent}, benchmark={benchmark}")
+    scanner = LeadershipScanner(universe=universe, benchmark=benchmark); leaders_df = scanner.run(top=top)
+    if leaders_df is not None and not leaders_df.empty:
+        if not silent:
+            print(f"\n--- Leader Scan Results ({universe.upper()}) ---")
+            display_cols = ['symbol', 'date', 'setup_type', 'score', 'r_multiple', 'Close', 'stop', 'target']
+            if 'date' not in leaders_df.columns and isinstance(leaders_df.index, (pd.DatetimeIndex, pd.Index)): leaders_df.reset_index(inplace=True)
+            if 'Close' not in leaders_df.columns:
+                 closes = []; date_col = 'date'
+                 if date_col not in leaders_df.columns: log.error("No 'date' col for Close lookup."); closes = [np.nan] * len(leaders_df)
+                 else:
+                     for idx in leaders_df.index:
+                         row = leaders_df.loc[idx]; sym = row['symbol']; event_date = pd.to_datetime(row[date_col])
+                         close_val = np.nan
+                         try:
+                             if sym in scanner.data and event_date in scanner.data[sym].index:
+                                 close_col_lookup = 'Close'
+                                 if close_col_lookup in scanner.data[sym].columns: close_val = scanner.data[sym].loc[event_date, close_col_lookup]
+                                 else: log.debug(f"Col 'Close' not found for {sym}")
+                             closes.append(close_val)
+                         except Exception as e: log.debug(f"Could not get cached Close {sym} {event_date}: {e}"); closes.append(np.nan)
+                 leaders_df['Close'] = closes
+            final_display_cols = []
+            for col in display_cols:
+                if col in leaders_df.columns: final_display_cols.append(col)
+                else: log.warning(f"Display column '{col}' missing."); leaders_df[col] = pd.NA; final_display_cols.append(col)
+            if 'symbol' not in leaders_df.columns: log.error("CRITICAL: 'symbol' missing."); return leaders_df
+            if 'date' in leaders_df.columns: leaders_df['date'] = pd.to_datetime(leaders_df['date']).dt.strftime('%Y-%m-%d')
+            print(leaders_df[final_display_cols].to_string(index=False, float_format="%.2f"))
+        if alert:
+            log.info("Dispatching alerts..."); today_str = dt.date.today().strftime('%Y-%m-%d'); subject = f"Leader Scan ({today_str}) - {len(leaders_df)} Matches ({universe.upper()})"
+            try:
+                final_display_cols = [col for col in display_cols if col in leaders_df.columns]; alert_df = leaders_df.copy()
+                if 'date' in alert_df.columns: alert_df['date'] = pd.to_datetime(alert_df['date']).dt.strftime('%Y-%m-%d')
+                body = alert_df[final_display_cols].to_string(index=False, float_format="%.2f")
+                dispatch(subject, body); log.info("Alerts dispatched.")
+            except Exception as e: log.error(f"Failed dispatch: {e}", exc_info=True)
+    elif not silent: log.info(f"No leaders found for universe '{universe}'."); print(f"\n--- No leaders found for {universe.upper()}. ---")
+    return leaders_df if leaders_df is not None else pd.DataFrame()
+
+# --- Function to Scan All Universes (Modified to return results) ---
+def run_scan_for_all_universes(top_per_universe: int = 5, alert: bool = False, benchmark: str = "SPY", return_results: bool = False):
+    """Scans all CSV files in the resources directory."""
+    resources_dir = _PACKAGE_ROOT / "resources"
+    if not resources_dir.is_dir(): log.error(f"Resources dir not found: {resources_dir}"); return {} if return_results else None
+    all_results = {}; found_universes = []
+    log.info(f"Scanning all universes in {resources_dir}...")
+    resource_files = sorted([item for item in os.listdir(resources_dir) if item.lower().endswith(".csv")])
+    # --- Add brief pause between universe scans ---
+    delay_between_universes = 15 # seconds
+    for i, item in enumerate(resource_files):
+        if item.startswith(('.', '~')): continue
+        universe_name = item[:-4]; log.info(f"--- Processing Universe: {universe_name} ---")
+        try:
+            leaders_df = run_daily_scan(universe=universe_name, top=top_per_universe, alert=False, silent=True, benchmark=benchmark)
+            if leaders_df is not None and not leaders_df.empty: all_results[universe_name] = leaders_df; found_universes.append(universe_name)
+            else: log.info(f"No results found for universe: {universe_name}")
+        except ValueError as ve: log.error(f"Skipping '{universe_name}' loading error: {ve}")
+        except Exception as e: log.error(f"Failed scan '{universe_name}': {type(e).__name__} - {e}", exc_info=False)
+
+        # Add a pause if not the last universe, to be kind to data sources if force_download is used
+        if i < len(resource_files) - 1:
+             log.info(f"Pausing briefly after processing {universe_name} for leader scan...")
+             time.sleep(delay_between_universes)
+
+
+    if return_results: log.info("Multi-universe scan complete. Returning results."); return all_results
+
+    # --- Original printing/alerting logic ---
+    log.info("\n--- Multi-Universe Scan Summary ---")
+    if not all_results: print("No leaders found in any universe."); return
+    for universe_name in found_universes:
+        if universe_name in all_results:
+             df = all_results[universe_name]; print(f"\n=== Top {len(df)} Leaders for {universe_name.upper()} ===")
+             display_cols = ['symbol', 'date', 'setup_type', 'score', 'r_multiple', 'Close', 'stop', 'target']
+             final_display_cols = []
+             for col in display_cols:
+                  if col in df.columns: final_display_cols.append(col)
+                  else: df[col] = pd.NA; final_display_cols.append(col)
+             if 'date' in df.columns:
+                try: df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+                except Exception as date_err: log.warning(f"Date format warning {universe_name}: {date_err}")
+             print(df[final_display_cols].to_string(index=False, float_format="%.2f"))
+    if alert: # Combined alert logic
+        log.info("Sending combined alert..."); combined_body = ""; total_leaders = 0
+        for universe_name in found_universes:
+             if universe_name in all_results:
+                 df = all_results[universe_name]; display_cols = ['symbol', 'date', 'setup_type', 'score', 'r_multiple', 'Close', 'stop', 'target']
+                 final_display_cols = [col for col in display_cols if col in df.columns]; alert_df = df.copy();
+                 if 'date' in alert_df.columns:
+                     try: alert_df['date'] = pd.to_datetime(alert_df['date']).dt.strftime('%Y-%m-%d')
+                     except: pass
+                 combined_body += f"\n=== Top {len(df)} Leaders {universe_name.upper()} ===\n"
+                 combined_body += alert_df[final_display_cols].to_string(index=False, float_format="%.2f") + "\n"
+                 total_leaders += len(df)
+        if total_leaders > 0:
+            today_str = dt.date.today().strftime('%Y-%m-%d'); subject = f"Multi-Universe Scan ({today_str}) - {total_leaders} Matches"
+            try: dispatch(subject, combined_body); log.info("Combined alert dispatched.")
+            except Exception as e: log.error(f"Failed dispatch: {e}", exc_info=True)
+
+    return None # Return None if printing/alerting
+
+# --- Command-Line Interface ---
+def _cli():
+    """Command-line interface setup and execution."""
+    parser = argparse.ArgumentParser(description="Run the Leader Stock Scanner.")
+    parser.add_argument("--universe", type=str, default="ALL", help="Stock universe name (e.g., sp500) or 'ALL'. Default: ALL")
+    parser.add_argument("--top", type=int, default=None, help="Number of top leaders (default: 5 for ALL, 20 for single).")
+    parser.add_argument("--alert", action="store_true", help="Send alerts.")
+    parser.add_argument("--silent", action="store_true", help="Suppress console output (single universe only).")
+    parser.add_argument("--force-download", action="store_true", help="Force data download, ignore cache.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--benchmark", type=str, default="SPY", help="Benchmark symbol (default: SPY).")
+
+    args = parser.parse_args()
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True)
+    logging.getLogger('leader_scan').setLevel(log_level); log.setLevel(log_level)
+    if args.debug: log.debug(f"Debug logging enabled.\nArgs: {args}\nConfig: {CONFIG}")
+    if args.force_download: log.info("Force download enabled."); CONFIG['force_download_flag'] = True
+    if args.universe.upper() == "ALL": top_n = args.top if args.top is not None else 5; run_scan_for_all_universes(top_per_universe=top_n, alert=args.alert, benchmark=args.benchmark)
+    else: top_n = args.top if args.top is not None else 20; run_daily_scan(universe=args.universe, top=top_n, alert=args.alert, silent=args.silent, benchmark=args.benchmark)
+    if 'force_download_flag' in CONFIG: del CONFIG['force_download_flag']
+
+if __name__ == "__main__":
+    _cli()
