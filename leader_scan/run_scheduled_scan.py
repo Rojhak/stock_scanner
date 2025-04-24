@@ -1,4 +1,4 @@
-# run_scheduled_scan.py
+# leader_scan/run_scheduled_scan.py
 """
 Script to run leader and specific advanced scans (MA_CROSS) for all universes
 and send a combined email alert. Designed for scheduled execution.
@@ -7,6 +7,8 @@ import sys
 import logging
 import datetime as dt
 import pandas as pd
+import time # Make sure time is imported if you use time.sleep()
+import numpy as np # Import numpy for np.nan
 
 # Configure logging FIRST
 log_level = logging.INFO # Or logging.DEBUG
@@ -15,16 +17,27 @@ log = logging.getLogger(__name__)
 
 # Import leader_scan components AFTER logging is set up
 try:
-    # Use run_scan_for_all_universes from main for leader scan
+    # Using absolute imports as intended when running with `python -m leader_scan.run_scheduled_scan`
     from leader_scan.main import run_scan_for_all_universes
-    # Use run_advanced_scan_for_all from advanced_screener
     from leader_scan.advanced_screener import run_advanced_scan_for_all
     from leader_scan.alert import dispatch
     from leader_scan.config import CONFIG
 except ImportError as e:
-    log.critical(f"Failed import leader_scan components: {e}. Check PYTHONPATH or if script is run from parent directory.", exc_info=True)
-    sys.exit(1)
+    # Fallback for potential direct execution issues (less ideal)
+    try:
+        log.warning(f"Initial import failed ({e}), trying relative imports...")
+        from .main import run_scan_for_all_universes
+        from .advanced_screener import run_advanced_scan_for_all
+        from .alert import dispatch
+        from .config import CONFIG
+    except ImportError as e_rel:
+        # ADD THIS PRINT for better debug if imports fail:
+        print(f"--- FATAL ERROR DURING IMPORT (Relative Fallback): {type(e_rel).__name__}: {e_rel} ---", flush=True)
+        log.critical(f"Failed import leader_scan components (standard and relative): {e_rel}. Check PYTHONPATH or if script is run from parent directory.", exc_info=True)
+        sys.exit(1)
 except Exception as e:
+    # ADD THIS PRINT for better debug if imports fail:
+    print(f"--- FATAL ERROR DURING IMPORT (General): {type(e).__name__}: {e} ---", flush=True)
     log.critical(f"Unexpected error during imports: {e}", exc_info=True)
     sys.exit(1)
 
@@ -79,6 +92,7 @@ def format_results_for_email(results_dict: dict, title: str, display_cols: list)
 
         # else:
             # Optional: Report empty universes if desired
+            # log.info(f"No results DataFrame found for universe '{universe}' in '{title}'.")
             # body += f"=== No results found for {universe.upper()} ===\n\n"
 
     if not found_any:
@@ -87,6 +101,8 @@ def format_results_for_email(results_dict: dict, title: str, display_cols: list)
 
 def main():
     """Main execution function for scheduled scan."""
+    # ADDED DEBUG PRINT
+    print("--- DEBUG: Entered main() function ---", flush=True)
     log.info("Starting scheduled scan run...")
     # Check for essential email config from environment variables/secrets
     if not all([CONFIG.get("smtp_host"), CONFIG.get("smtp_user"), CONFIG.get("smtp_password"), CONFIG.get("from_email"), CONFIG.get("to_emails")]):
@@ -100,17 +116,61 @@ def main():
     advanced_results = run_advanced_scan_for_all(top_per_universe=TOP_N, setup_type_filter=ADVANCED_SETUP_TYPE_FILTER, benchmark=BENCHMARK, return_results=True)
 
     # Add debug logs for intermediate results
-    log.debug(f"Leader Results: {leader_results}")
-    log.debug(f"Advanced Results: {advanced_results}")
+    log.debug(f"Leader Results Type: {type(leader_results)}")
+    if isinstance(leader_results, dict):
+        for k, v in leader_results.items(): log.debug(f"  Leader Key: {k}, Type: {type(v)}, Empty: {v.empty if isinstance(v, pd.DataFrame) else 'N/A'}")
+    log.debug(f"Advanced Results Type: {type(advanced_results)}")
+    if isinstance(advanced_results, dict):
+        for k, v in advanced_results.items(): log.debug(f"  Advanced Key: {k}, Type: {type(v)}, Empty: {v.empty if isinstance(v, pd.DataFrame) else 'N/A'}")
 
-    # Validate for duplicate results
-    if leader_results == advanced_results:
-        log.warning("Leader and Advanced scan results are identical. Skipping duplicate results in email.")
-        advanced_results = None  # Skip advanced results if they are identical
+    # --- Start of Corrected Block for Duplicate Check ---
+    are_results_identical = False # Assume not identical initially
+    # Check if both results are dictionaries and have the same keys (universes)
+    if isinstance(leader_results, dict) and isinstance(advanced_results, dict):
+        if leader_results.keys() == advanced_results.keys():
+            identical = True # Assume identical until proven otherwise
+            log.debug(f"Comparing results for keys: {list(leader_results.keys())}") # Debug keys
+            for key in leader_results:
+                df_leader = leader_results.get(key)
+                df_advanced = advanced_results.get(key)
+
+                # Check if both values are pandas DataFrames before comparing
+                if isinstance(df_leader, pd.DataFrame) and isinstance(df_advanced, pd.DataFrame):
+                    try:
+                        # Use pandas .equals() for robust comparison (checks labels and values)
+                        if not df_leader.equals(df_advanced):
+                            identical = False
+                            log.debug(f"Results for '{key}' differ using .equals().")
+                            break # Stop checking if one differs
+                    except Exception as e:
+                        log.warning(f"Error comparing DataFrames for key '{key}' using .equals(): {e}")
+                        identical = False # Assume not identical if comparison fails
+                        break
+                # Handle cases where one or both might be None or not a DataFrame for a given key
+                elif df_leader is not df_advanced: # If types differ or one is None, they aren't identical
+                    identical = False
+                    log.debug(f"Result types for '{key}' differ or one is None.")
+                    break
+            # If the loop completed without finding differences, they are identical
+            are_results_identical = identical
+            log.debug(f"Finished key comparison. Are results identical? {are_results_identical}")
+        else:
+             log.debug("Result dictionaries have different keys (universes). Not identical.")
+             are_results_identical = False # Keys differ, so not identical
+    elif leader_results is not advanced_results: # Handle cases where one might be None or not a dict at all
+         are_results_identical = False
+         log.debug(f"Result types are different (dict vs {type(advanced_results)} or vice versa) or one is None. Not identical.")
+
+
+    if are_results_identical:
+        log.warning("Leader and Advanced scan results appear identical based on content. Skipping advanced results in email.")
+        advanced_results = None # Set advanced_results to None ONLY if confirmed identical
+    # --- End of Corrected Block ---
+
 
     log.info("Formatting email body...")
     today_str = dt.date.today().strftime('%Y-%m-%d')
-    subject = f"Stock Scan Results - {today_str}"
+    subject = f"Stock Scan Results - {today_str}" # Updated Subject
 
     email_body = f"Scan Report for {today_str}\n"
     email_body += "="*40 + "\n\n"
@@ -119,10 +179,23 @@ def main():
     email_body += format_results_for_email(leader_results, "Standard Leader Scan", DISPLAY_COLS_LEADER)
     email_body += "="*40 + "\n\n"
 
-    # Format Advanced Scan Results (if not skipped)
+    # Format Advanced Scan Results (if not skipped or empty)
+    # This logic now also handles the case where advanced_results was set to None by the check above
     if advanced_results:
         email_body += format_results_for_email(advanced_results, f"Advanced Scan ({ADVANCED_SETUP_TYPE_FILTER})", DISPLAY_COLS_ADV)
         email_body += "="*40 + "\n"
+    else:
+        # Explicitly state if advanced results are skipped or were empty
+        if are_results_identical:
+             email_body += f"--- Advanced Scan ({ADVANCED_SETUP_TYPE_FILTER}) (Top {TOP_N}) ---\n\n"
+             email_body += "Results identical to Standard Leader Scan, not repeated.\n"
+             email_body += "="*40 + "\n"
+        else:
+             # Handle case where advanced_results was initially empty (not due to duplication)
+             email_body += f"--- Advanced Scan ({ADVANCED_SETUP_TYPE_FILTER}) (Top {TOP_N}) ---\n\n"
+             email_body += f"No setups found matching criteria in any universe for Advanced Scan ({ADVANCED_SETUP_TYPE_FILTER}).\n"
+             email_body += "="*40 + "\n"
+
 
     # Send Email using dispatch function from alert.py
     log.info(f"Attempting to send combined email alert to: {CONFIG.get('to_emails')}")
@@ -130,15 +203,19 @@ def main():
         dispatch(subject, email_body)
         log.info("Combined email alert dispatched successfully.")
     except Exception as e:
-        # ADD THIS PRINT:
-        print(f"--- FATAL ERROR DURING IMPORT: {type(e).__name__}: {e} ---", flush=True)
-        # Keep original logging and exit:
-        log.critical(f"Unexpected error during imports: {e}", exc_info=True)
-        sys.exit(1)
         log.error(f"Failed to send combined email alert: {e}", exc_info=True)
-        sys.exit(1)
+        sys.exit(1) # Exit if dispatch fails
 
     log.info("Scheduled scan run finished successfully.")
+
+
+# --- ADD THIS BLOCK AT THE VERY END OF THE FILE ---
+# (Your previous version might have had the print statement inside here already)
+# ADDED DEBUG PRINTS
+print("--- DEBUG: Reached end of script top-level ---", flush=True)
+print(f"--- DEBUG: __name__ is set to: {__name__} ---", flush=True)
+
 if __name__ == "__main__":
-    print("--- DEBUG: Entered __main__ block, calling main() ---", flush=True) # Add this line
+    print("--- DEBUG: Entered __main__ block, calling main() ---", flush=True)
     main()
+# --- END OF ADDED/MODIFIED BLOCK ---
