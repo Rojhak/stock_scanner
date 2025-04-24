@@ -99,23 +99,15 @@ def get_price_data(
 
     Returns CAPITALIZED column names (Open, High, Low, Close, Volume, Adj Close).
     """
-    global _memory_cache  # Allow access to module-level cache
+    global _memory_cache # Allow access to module-level cache
 
     # --- Input validation and date calculation ---
-    if yf is None:
-        log.error("yfinance not installed.")
-        return None
+    if yf is None: log.error("yfinance not installed."); return None
 
-    if isinstance(tickers, str):
-        tickers_list = [s.strip().upper() for s in tickers.replace(",", " ").split() if s.strip()]
-    elif isinstance(tickers, list):
-        tickers_list = [s.strip().upper() for s in tickers if isinstance(s, str) and s.strip()]
-    else:
-        log.error(f"Invalid type for 'tickers': {type(tickers)}.")
-        return None
-    if not tickers_list:
-        log.warning("No valid tickers provided.")
-        return pd.DataFrame()
+    if isinstance(tickers, str): tickers_list = [s.strip().upper() for s in tickers.replace(",", " ").split() if s.strip()]
+    elif isinstance(tickers, list): tickers_list = [s.strip().upper() for s in tickers if isinstance(s, str) and s.strip()]
+    else: log.error(f"Invalid type for 'tickers': {type(tickers)}."); return None
+    if not tickers_list: log.warning("No valid tickers provided."); return pd.DataFrame()
 
     today = dt.date.today()
     final_end_date = end_date or today
@@ -123,34 +115,31 @@ def get_price_data(
 
     # Respect global force download flag
     global_force_download = CONFIG.get('force_download_flag', False)
-    if global_force_download:
-        force_download = True
-        log.info("Forcing download due to flag.")
+    if global_force_download: force_download = True; log.info("Forcing download due to flag.")
 
     # --- Create unique key for caching ---
     cache_key_tuple = (
-        tuple(sorted(tickers_list)),  # Use sorted tuple of tickers
+        tuple(sorted(tickers_list)), # Use sorted tuple of tickers
         final_start_date,
         final_end_date,
         interval
     )
-    cache_key_str = str(cache_key_tuple)  # Use string representation as dict key
+    cache_key_str = str(cache_key_tuple) # Use string representation as dict key
 
     # --- 1. Check In-Memory Cache ---
     if not force_download and cache_key_str in _memory_cache:
         log.debug(f"Loading data from memory cache for key: {cache_key_str}")
+        # Return a copy to prevent modifying the cached DataFrame unintentionally
         return _memory_cache[cache_key_str].copy()
 
     # --- 2. Check File Cache (Parquet) ---
-    cache_file = _get_cache_key(
-        tickers_list, final_start_date, final_end_date, interval,
-        universe_name=universe_name_for_cache or (tickers_list[0] if len(tickers_list) == 1 else None)
-    )
+    cache_file = _get_cache_key(tickers_list, final_start_date, final_end_date, interval,
+                                universe_name=universe_name_for_cache or (tickers_list[0] if len(tickers_list) == 1 else None))
 
     if not force_download and cache_file and cache_file.exists() and cache_file.is_file():
         try:
             log.debug(f"Loading cached data from file: {cache_file}")
-            df = pd.read_parquet(cache_file)  # Requires pyarrow
+            df = pd.read_parquet(cache_file) # Requires pyarrow
             if not df.empty:
                 # Basic validation (can be more thorough)
                 expected_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -161,93 +150,121 @@ def get_price_data(
                     log.debug(f"File cache validated for {cache_file}.")
                     # Store in memory cache before returning
                     _memory_cache[cache_key_str] = df
-                    return df.copy()
+                    return df.copy() # Return a copy
                 else:
                     log.warning(f"Cached file {cache_file} missing standard columns ({actual_cols}). Forcing download.")
-                    force_download = True  # Force download if cache is invalid
+                    force_download = True # Force download if cache is invalid
             else:
                 log.warning(f"Cached file {cache_file} is empty. Forcing download.")
-                force_download = True  # Force download if cache is empty
+                force_download = True # Force download if cache is empty
         except ImportError:
             log.warning("pyarrow not installed. Cannot read from file cache.")
+            # Continue to download attempt
         except Exception as e:
             log.error(f"Error reading cache file {cache_file}: {e}. Forcing download.", exc_info=False)
-            force_download = True
+            force_download = True # Force download on read error
 
-    # --- 3. Download Data with Batch Processing ---
+    # --- 3. Download Data ---
+    # Condition: force_download is True OR file cache was missed/invalid OR not found in memory
+    # (Redundant check for memory cache here, but safe)
     if force_download or cache_key_str not in _memory_cache:
         log.info(f"Fetching/Downloading price data via yfinance for: {', '.join(tickers_list)}")
-        batch_size = 50  # Number of tickers per batch
-        delay_between_batches = 5  # Delay in seconds between batches
-        all_data = []
+        df_downloaded = None
         yf_exception = None
 
         try:
-            for i in range(0, len(tickers_list), batch_size):
-                batch = tickers_list[i:i + batch_size]
-                try:
-                    log.info(f"Fetching batch: {batch}")
-                    df_batch = yf.download(
-                        tickers=" ".join(batch),
-                        start=final_start_date,
-                        end=final_end_date + dt.timedelta(days=1),  # yfinance end is exclusive
-                        interval=interval,
-                        group_by="ticker",
-                        auto_adjust=False, prepost=False, threads=True,
-                        progress=False, ignore_tz=True
-                    )
-                    if not df_batch.empty:
-                        all_data.append(df_batch)
-                    else:
-                        log.warning(f"No data returned for batch: {batch}")
-                except Exception as e:
-                    log.error(f"Batch {batch} failed: {e}")
-                time.sleep(delay_between_batches)  # Delay to avoid rate limiting
+            ticker_string_yf = " ".join(tickers_list)
+            # Use group_by='ticker' for consistent MultiIndex output
+            group_by_arg = "ticker"
+            log.debug(f"Calling yf.download(tickers='{ticker_string_yf}', start='{final_start_date}', end='{final_end_date + dt.timedelta(days=1)}', interval='{interval}', group_by='{group_by_arg}')")
 
-            # Combine all data
-            if all_data:
-                df_downloaded = pd.concat(all_data, axis=1)
-            else:
-                log.warning("No valid data downloaded.")
-                df_downloaded = pd.DataFrame()
+            df_downloaded = yf.download(tickers=ticker_string_yf, start=final_start_date,
+                                        end=final_end_date + dt.timedelta(days=1), # yfinance end is exclusive
+                                        interval=interval,
+                                        group_by=group_by_arg,
+                                        auto_adjust=False, prepost=False, threads=True,
+                                        progress=False, ignore_tz=True)
 
         except Exception as e:
             yf_exception = e
-            log.error(f"Exception during batch processing: {type(e).__name__} - {e}", exc_info=True)
-            df_downloaded = pd.DataFrame()
+            log.error(f"Exception DIRECTLY from yf.download for {tickers_list}: {type(e).__name__} - {e}", exc_info=True)
 
         # --- Post-Download Processing & Validation ---
+        log.debug(f"yf.download completed. Exception caught: {yf_exception is not None}")
+        log.debug(f"Raw result type: {type(df_downloaded)}")
         if df_downloaded is None or df_downloaded.empty:
             log.warning(f"No data downloaded via yfinance (result is None or empty) for: {', '.join(tickers_list)}")
-            _memory_cache[cache_key_str] = pd.DataFrame()
+             # Cache empty DataFrame to prevent re-download attempts for failed tickers in this run
+            df_processed = pd.DataFrame()
+            _memory_cache[cache_key_str] = df_processed
+            # Optionally save empty file cache too (requires pyarrow)
             if cache_file:
-                try:
-                    pd.DataFrame().to_parquet(cache_file, compression="snappy")
-                except Exception as e_save:
-                    log.error(f"Error saving empty cache file {cache_file}: {e_save}", exc_info=False)
-            return None if yf_exception else pd.DataFrame()
+                try: df_processed.to_parquet(cache_file, compression="snappy")
+                except Exception as e_save: log.error(f"Error saving empty cache file {cache_file}: {e_save}", exc_info=False)
+            # Return None if a yfinance exception occurred, empty DF otherwise
+            return None if yf_exception else df_processed
 
-        # Process successful download
+        # --- Process successful download ---
+        successful_tickers = []
         df_processed = pd.DataFrame()
+        expected_cols = ['Open', 'High', 'Low', 'Close', 'Volume'] # CAPITALIZED
+
         if isinstance(df_downloaded.columns, pd.MultiIndex):
-            df_processed = df_downloaded
+            valid_tickers_data = {}
+            for ticker in df_downloaded.columns.levels[0]:
+                if ticker in tickers_list: # Process only requested tickers
+                    ticker_df = df_downloaded[ticker].copy() # Work on copy
+                    # Standardize columns to Capitalized
+                    ticker_df.columns = [str(c).strip().capitalize() for c in ticker_df.columns]
+                    if all(col in ticker_df.columns for col in expected_cols):
+                        # Drop rows where Close is NaN before adding
+                        valid_tickers_data[ticker] = ticker_df.dropna(subset=['Close'])
+                        if not valid_tickers_data[ticker].empty:
+                             successful_tickers.append(ticker)
+                        else: log.debug(f"{ticker} data became empty after dropping NaN Close.")
+                    else: log.warning(f"{ticker} missing standard columns: {ticker_df.columns.tolist()}. Skipping.")
+            failed_tickers = [t for t in tickers_list if t not in successful_tickers]
+            if failed_tickers: log.warning(f"Failed/Invalid download for: {', '.join(failed_tickers)}")
+            if valid_tickers_data: df_processed = pd.concat(valid_tickers_data, axis=1)
+            else: log.error("No valid data obtained for requested tickers (MultiIndex case)."); df_processed = pd.DataFrame()
         else:
-            log.warning("Unexpected structure returned by yfinance. Returning raw data.")
+            # This case should be less common with group_by='ticker'
+            log.warning(f"Unexpected non-MultiIndex df structure from yfinance for {tickers_list}. Cols: {df_downloaded.columns}. Attempting processing...")
+            df_temp = df_downloaded.copy()
+            df_temp.columns = [str(c).strip().capitalize() for c in df_temp.columns]
+            if all(col in df_temp.columns for col in expected_cols) and len(tickers_list)==1:
+                 df_temp = df_temp.dropna(subset=['Close'])
+                 if not df_temp.empty:
+                      # Create MultiIndex for consistency if it's a single ticker result
+                      df_temp.columns = pd.MultiIndex.from_product([tickers_list, df_temp.columns])
+                      df_processed = df_temp
+                      successful_tickers = tickers_list
+                 else: log.warning(f"Single ticker {tickers_list[0]} empty after dropping NaN Close.")
+            else: log.error("Cannot process non-MultiIndex structure or missing columns.")
+
+
+        if df_processed.empty:
+            log.error(f"No valid data obtained for requested tickers after processing.")
+            # Cache empty DataFrame
+            _memory_cache[cache_key_str] = df_processed
+            if cache_file:
+                try: df_processed.to_parquet(cache_file, compression="snappy")
+                except Exception as e_save: log.error(f"Error saving empty cache file {cache_file}: {e_save}", exc_info=False)
+            return df_processed # Return empty DataFrame
 
         # --- Cache valid, processed data ---
+        # Store in memory cache
         _memory_cache[cache_key_str] = df_processed
+        # Save to file cache (if possible)
         if cache_file:
-            try:
-                df_processed.to_parquet(cache_file, compression="snappy")
-                log.info(f"Saved data to cache: {cache_file}")
-            except Exception as e_save:
-                log.error(f"Error saving cache file {cache_file}: {e_save}", exc_info=False)
+             try:
+                 df_processed.to_parquet(cache_file, compression="snappy")
+                 log.info(f"Saved data ({len(successful_tickers)} tickers) to file cache: {cache_file}")
+             except ImportError:
+                  log.warning("pyarrow not installed. Cannot save to file cache.")
+             except Exception as e: log.error(f"Error saving file cache {cache_file}: {e}", exc_info=False)
 
-        return df_processed.copy()
-
-    # Fallback
-    log.warning("Returning None from get_price_data (unexpected execution path).")
-    return None
+        return df_processed.copy() # Return a copy
 
     # Fallback if logic path is unexpected
     log.warning("Returning None from get_price_data (unexpected execution path).")
