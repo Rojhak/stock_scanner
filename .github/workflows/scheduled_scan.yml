@@ -57,4 +57,4 @@ jobs:
           LS_TO_EMAILS: ${{ secrets.LS_TO_EMAILS }}
         run: |
           
-          python leader_scan/run_scheduled_scan.py
+          python -m leader_scan.run_scheduled_scan
