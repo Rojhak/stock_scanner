@@ -2,6 +2,7 @@
 """
 Main orchestrator for the Leader Scan package.
 Provides high-level functions to run scans and the LeadershipScanner class.
+Can scan single universes or all universes found in the resources directory.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ import pandas as pd
 from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path # Import needed
 import os
+import time # Import time for delay between universes
 import numpy as np
 
 # Setup basic logging
@@ -79,7 +81,7 @@ def _calculate_required_indicators(df: pd.DataFrame, bench_close: Optional[pd.Se
 
         # Relative Strength
         rs_line_col = 'rs_line'; rs_slope_col = 'rs_slope'
-        # *** MODIFIED IF CONDITION ***
+        # *** Corrected IF condition for truth value ambiguity ***
         can_calc_rs = (
             bench_close is not None
             and not bench_close.empty
@@ -97,7 +99,7 @@ def _calculate_required_indicators(df: pd.DataFrame, bench_close: Optional[pd.Se
                   if not df_out[rs_line_col].isnull().all(): df_out[rs_slope_col] = df_out[rs_line_col].diff(5)
                   else: df_out[rs_slope_col] = np.nan
         else:
-            log.debug(f"Skipping RS Calcs (Benchmark valid: {bench_close is not None and not bench_close.empty}, Close col valid: {close_col in df_out.columns and df_out[close_col].notnull().any()})")
+            log.debug(f"Skipping RS Calcs (Benchmark valid: {bench_close is not None and not bench_close.empty}, Close valid: {close_col in df_out.columns and df_out[close_col].notnull().any()})")
             df_out[rs_line_col] = np.nan; df_out[rs_slope_col] = np.nan
         log.debug(f"Finished indicators. Lowercase cols: {df_out.columns.tolist()}")
     except Exception as e: log.warning(f"Error indicator calc: {e}", exc_info=True)
@@ -111,13 +113,24 @@ def _calculate_required_indicators(df: pd.DataFrame, bench_close: Optional[pd.Se
     log.debug(f"Cols after renaming back: {df_out.columns.tolist()}")
     return df_out
 
-# Corrected _fetch_and_prepare_data with robust benchmark handling
+# Corrected _fetch_and_prepare_data with fixed SyntaxError and robust benchmark handling
 def _fetch_and_prepare_data(symbols: List[str], benchmark: str = "SPY", period: str = '2y', interval: str = '1d', universe_name: Optional[str] = None) -> Tuple[Optional[Dict[str, pd.DataFrame]], Optional[pd.Series]]:
     """Fetches price data, prepares benchmark close. Handles MultiIndex benchmark."""
     log.info(f"Fetching data: {len(symbols)} symbols (Universe: {universe_name or 'N/A'}), Benchmark: {benchmark}...")
     today = dt.date.today(); start_date = today - dt.timedelta(days=CONFIG.get("cache_days", 730))
-    if 'y' in period: try: years = int(period.replace('y','')); start_date = today - dt.timedelta(days=years*365); except ValueError: pass
-    elif 'm' in period: try: months = int(period.replace('m','')); start_date = today - dt.timedelta(days=months*30); except ValueError: pass
+    # *** CORRECTED SyntaxError for date range calculation ***
+    if 'y' in period:
+        try: # Indent try block
+            years = int(period.replace('y',''))
+            start_date = today - dt.timedelta(days=years*365)
+        except ValueError:
+            pass # Keep default start_date if conversion fails
+    elif 'm' in period:
+        try: # Indent try block
+            months = int(period.replace('m',''))
+            start_date = today - dt.timedelta(days=months*30) # Approximation
+        except ValueError:
+            pass # Keep default start_date if conversion fails
 
     # --- Fetch Benchmark Data ---
     bench_df = get_price_data(benchmark, start_date=start_date, end_date=today, interval=interval, universe_name_for_cache=benchmark)
@@ -200,7 +213,6 @@ def _process_and_score_symbol(symbol: str, df: pd.DataFrame, bench_close: Option
     if df.empty or len(df) < required_rows: log.debug(f"Skipping {symbol}: Insufficient data."); return None
     try:
         df_with_indicators = _calculate_required_indicators(df, bench_close) # Returns Capitalized
-        # Check for essential indicator validity after calculation
         if 'ATR' not in df_with_indicators or df_with_indicators['ATR'].isnull().all(): log.warning(f"ATR failed {symbol}, skipping scoring."); return None
 
         scored_results = score_dataframe(df_with_indicators) # Scorer expects Capitalized
@@ -232,7 +244,7 @@ class LeadershipScanner:
         fetched_data, benchmark_close_series = _fetch_and_prepare_data(
             self.symbols, self.benchmark_symbol, period=f"{data_period}d",
             interval=data_interval, universe_name=self.universe_name )
-        self.benchmark_close = benchmark_close_series
+        self.benchmark_close = benchmark_close_series # Store result correctly
 
         if not fetched_data: log.error("Data fetching failed."); return pd.DataFrame()
         self.data = fetched_data; all_results = []
@@ -259,7 +271,7 @@ class LeadershipScanner:
         if not sort_cols: leaders = filtered_df.head(top)
         else: leaders = filtered_df.sort_values(sort_cols, ascending=ascending_order).head(top)
         log.info(f"Scan complete for '{self.universe_name}'. Identified {len(leaders)} leaders.")
-        self.results = leaders; return leaders.reset_index()
+        self.results = leaders; return leaders.reset_index() # Always return with symbol col
 
 def run_daily_scan(
     universe: str = CONFIG.get("universe", "sp500"), top: int = 20, alert: bool = False,
@@ -313,8 +325,7 @@ def run_scan_for_all_universes(top_per_universe: int = 5, alert: bool = False, b
     all_results = {}; found_universes = []
     log.info(f"Scanning all universes in {resources_dir}...")
     resource_files = sorted([item for item in os.listdir(resources_dir) if item.lower().endswith(".csv")])
-    # --- Add brief pause between universe scans ---
-    delay_between_universes = 15 # seconds
+    delay_between_universes = 15 # seconds (Increase if rate limits hit between universes)
     for i, item in enumerate(resource_files):
         if item.startswith(('.', '~')): continue
         universe_name = item[:-4]; log.info(f"--- Processing Universe: {universe_name} ---")
@@ -325,11 +336,10 @@ def run_scan_for_all_universes(top_per_universe: int = 5, alert: bool = False, b
         except ValueError as ve: log.error(f"Skipping '{universe_name}' loading error: {ve}")
         except Exception as e: log.error(f"Failed scan '{universe_name}': {type(e).__name__} - {e}", exc_info=False)
 
-        # Add a pause if not the last universe, to be kind to data sources if force_download is used
+        # Add a pause if not the last universe
         if i < len(resource_files) - 1:
              log.info(f"Pausing briefly after processing {universe_name} for leader scan...")
-             time.sleep(delay_between_universes)
-
+             time.sleep(delay_between_universes) # Requires 'import time'
 
     if return_results: log.info("Multi-universe scan complete. Returning results."); return all_results
 
@@ -387,7 +397,7 @@ def _cli():
     if args.force_download: log.info("Force download enabled."); CONFIG['force_download_flag'] = True
     if args.universe.upper() == "ALL": top_n = args.top if args.top is not None else 5; run_scan_for_all_universes(top_per_universe=top_n, alert=args.alert, benchmark=args.benchmark)
     else: top_n = args.top if args.top is not None else 20; run_daily_scan(universe=args.universe, top=top_n, alert=args.alert, silent=args.silent, benchmark=args.benchmark)
-    if 'force_download_flag' in CONFIG: del CONFIG['force_download_flag']
+    if 'force_download_flag' in CONFIG: del CONFIG['force_download_flag'] # Clean up flag
 
 if __name__ == "__main__":
     _cli()
